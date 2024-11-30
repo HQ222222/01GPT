@@ -20,6 +20,7 @@
 - [实现因果注意力机制](./causal_attention.ipynb)
 - [实现多头注意力](./multi_attention.ipynb)
 - [构建TransformerBlock](./transformer.ipynb)
+- [构建MiniGPT](./model.ipynb)
 - ……(持续更新中)
 
 ## 💥 数据集
