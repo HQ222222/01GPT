@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from typing import Tuple, List
+from flash_attn import flash_attn_func
 
 
 inputs = torch.tensor(
@@ -107,7 +108,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(b, num_tokens, self.num_heads, self.head_dim)
         v = v.view(b, num_tokens, self.num_heads, self.head_dim)
 
-        q, k = apply_rotary_emb(q, k, pos_cis)
+        q, k = apply_rotary_emb(q, k, pos_cis) if pos_cis is not None else (q, k)
         
         # 交换第2维和第3维，这一步过后，形状变为：b, num_heads, num_tokens, head_dim
         q = q.transpose(1, 2)   
@@ -122,12 +123,71 @@ class MultiHeadAttention(nn.Module):
         # 注意力掩码运算
         if attention_mask is not None:
             # filled the padding with -inf
-            scaled_atten_scores = scaled_atten_scores.masked_fill(attention_mask.bool(), -torch.inf)
+            scaled_atten_scores = scaled_atten_scores.masked_fill(attention_mask==0, -torch.inf)
 
         atten_weights = torch.softmax(scaled_atten_scores, dim=-1)
         atten_weights = self.dropout(atten_weights)
 
         context_vecs = atten_weights @ v   # shape: b, num_heads, num_tokens, head_dim
+        context_vecs = context_vecs.transpose(1,2)  # shape: b, num_tokens, num_heads, head_dim
+        context_vecs = context_vecs.contiguous().view(b, num_tokens, self.dim_out)
+        output = self.Wo(context_vecs)
+
+        return output, past_kv
+
+
+class FlashMultiHeadAttention(MultiHeadAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+    def forward(self, x, pos_cis=None, attention_mask=None, use_kv_cache=False, past_kv:Tuple[torch.Tensor]=None):
+        # 输入形状
+        b, num_tokens, dim_in = x.shape
+
+        # 求Q\K\V矩阵，形状变为： b, num_tokens, dim_out
+        if use_kv_cache:
+            current_token = x[:, -1:, :]
+            # 如果past_kv存在，则只计算current_token的q\k\v
+            if past_kv != None:
+                past_k, past_v = past_kv
+                q = torch.cat((torch.zeros_like(x[:, :-1, :]), self.Wq(current_token)), dim=1)
+                k = torch.cat((past_k, self.Wk(current_token)), dim=1)
+                v = torch.cat((past_v, self.Wv(current_token)), dim=1)
+            else: # 如果past_kv不存在，则计算全部
+                q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+            past_kv = (k, v)
+        else:
+            q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+
+        # 变换形状，将最后一维拆成多头，每个头有head_dim维，矩阵形状由三维变为四维。
+        q = q.view(b, num_tokens, self.num_heads, self.head_dim)
+        k = k.view(b, num_tokens, self.num_heads, self.head_dim)
+        v = v.view(b, num_tokens, self.num_heads, self.head_dim)
+
+        q, k = apply_rotary_emb(q, k, pos_cis) if pos_cis is not None else (q, k)
+        
+        # 交换第2维和第3维，这一步过后，形状变为：b, num_heads, num_tokens, head_dim
+        q = q.transpose(1, 2)   
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        input_dtype = q.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            else:
+                target_dtype = torch.float16
+            # print(f"cast from input_dtype from {input_dtype} to {target_dtype}, Wq.dtype: {self.Wq.weight.dtype}")
+            # 确保 q, k, v 是 float16 或 bfloat16
+            q = q.to(dtype=target_dtype)
+            k = k.to(dtype=target_dtype)
+            v = v.to(dtype=target_dtype)
+
+        dropout_rate = self.dropout.p if self.training else 0.0
+        context_vecs = flash_attn_func(q, k, v, dropout_p=dropout_rate, softmax_scale=self.head_dim ** -0.5, causal=True)
+        context_vecs = context_vecs.to(dtype=input_dtype)
+        
         context_vecs = context_vecs.transpose(1,2)  # shape: b, num_tokens, num_heads, head_dim
         context_vecs = context_vecs.contiguous().view(b, num_tokens, self.dim_out)
         output = self.Wo(context_vecs)

@@ -10,6 +10,8 @@ from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer
 from attention_v1 import MultiHeadAttention, FlashMultiHeadAttention
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+
+
 MODEL_CONFIG = {
     "vocab_size": 32000, # Vocabulary size
     "context_length": 1024, # Context length
@@ -95,6 +97,60 @@ def attention_mask_to_4d(attention_mask, num_heads):
     attention_mask = attention_mask.repeat(1, num_heads, seq_len, 1)
     # invert the attention mask，where the position of value 1 will be masked with -inf
     return (1 - attention_mask)
+
+class GPTModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.context_length = cfg['context_length']
+        self.token_emb = nn.Embedding(cfg['vocab_size'], cfg['emb_dim'])
+        
+        # self.pos_emb = nn.Embedding(cfg['context_length'], cfg['emb_dim'])
+        self.drop_emb = nn.Dropout(cfg['drop_rate'])
+        self.decode_layers = nn.Sequential(*[
+            TransformerBlock(cfg) for _ in range(cfg['n_layers'])
+        ])
+        pos_cis = precompute_pos_cis(cfg['emb_dim'] // cfg['n_heads'], cfg['context_length'])
+        self.register_buffer("pos_cis", pos_cis, persistent=False)
+        self.final_norm = LayerNorm(cfg['emb_dim'])
+        self.out_head = nn.Linear(cfg['emb_dim'], cfg['vocab_size'])
+
+    def forward(self, inputs):
+        b, seq_len = inputs.shape
+        pos_cis = self.pos_cis[:seq_len]
+        x = self.token_emb(inputs)
+        # pos_embeddings = self.pos_emb(torch.arange(seq_len, device=inputs.device))
+        # x  = token_embeddings + pos_embeddings
+        x = self.drop_emb(x)
+        for i, block in enumerate(self.decode_layers):
+            x = block(x, pos_cis)
+        # x = self.decode_layers(x, pos_cis)
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
+ 
+    def generate(self, token_ids, max_new_tokens=256, stop_token_id=-1):
+        assert isinstance(max_new_tokens, int) and max_new_tokens > 0
+        eos_reached = torch.zeros(len(token_ids), dtype=torch.bool, device=token_ids.device)
+        for _ in range(max_new_tokens):
+            # 如果生成序列过程中超出上下文长度，则由后往前截取context_length个token。
+            context_ids = token_ids[:, -self.context_length:]  
+            with torch.no_grad():
+                output = self(context_ids)  # shape: batch, n_tokens, vocab_size
+
+            # 只取每个序列最后一个token的输出向量作为logits, shape变为: batch, vocab_size
+            logits = output[:, -1, :]        
+            # 使用softmax函数将logits转换为下一个token的概率分布，shape仍是: batch, vocab_size
+            probs = torch.softmax(logits, dim=-1)   
+            # 取概率最大的作为next_token_ids，形状变为：batch, 1
+            next_token_ids = torch.argmax(probs, dim=-1, keepdim=True)
+            # 将next_token_id连接到下一个token的结尾， 形状变为：batch, n_tokens+1
+            token_ids = torch.cat((token_ids, next_token_ids), dim=1)
+            # 更新 eos_reached
+            eos_reached |= (next_token_ids.squeeze(-1) == stop_token_id)
+            if eos_reached.all():
+                break
+
+        return token_ids
         
 class GPTConfig(PretrainedConfig):
     # 每个模型都必须有一个独特的model_type，否则会报"Should have a `model_type` key in its config.json"
@@ -209,3 +265,23 @@ class MiniGPT(PreTrainedModel):
                 break
 
         return input_ids
+    
+def generate_sequence(model, token_ids, max_new_tokens, context_length):
+    # TODO 所有序列都结束时，提前退出循环
+    for _ in range(max_new_tokens):
+        # 如果生成序列过程中超出上下文长度，则由后往前截取context_length个token。
+        context_ids = token_ids[:, -context_length:]  
+
+        with torch.no_grad():
+            output = model(context_ids)  # shape: batch, n_tokens, vocab_size
+
+        # 只取每个序列最后一个token的输出向量作为logits, shape变为: batch, vocab_size
+        logits = output[:, -1, :]        
+        # 使用softmax函数将logits转换为下一个token的概率分布，shape仍是: batch, vocab_size
+        probs = torch.softmax(logits, dim=-1)   
+        # 取概率最大的作为next_token_ids，形状变为：batch, 1
+        next_token_ids = torch.argmax(probs, dim=-1, keepdim=True)
+        # 将next_token_id连接到下一个token的结尾， 形状变为：batch, n_tokens+1
+        token_ids = torch.cat((token_ids, next_token_ids), dim=1)
+
+    return token_ids
